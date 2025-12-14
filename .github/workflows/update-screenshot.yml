@@ -10,6 +10,8 @@ on:
 jobs:
   update-screenshot:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to push commits back to the repository
     
     steps:
       - name: Checkout repository
@@ -17,6 +19,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 2  # Need at least 2 commits to check the last one
+          persist-credentials: true  # Required to push commits
 
       # Prevent infinite loop: skip if last commit was from this workflow
       - name: Check if should skip
