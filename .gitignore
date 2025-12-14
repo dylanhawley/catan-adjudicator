@@ -26,6 +26,10 @@ node_modules/
 out/
 *.log
 
+# Temporary files created by CI workflows (root level only)
+/package.json
+/package-lock.json
+
 # IDE
 .vscode/
 .idea/

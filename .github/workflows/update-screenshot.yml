@@ -51,6 +51,7 @@ jobs:
           npm init -y
           npm install playwright
           npx playwright install --with-deps chromium
+        # Note: package.json/package-lock.json are temporary and won't be committed
 
       - name: Build frontend
         if: steps.should_skip.outputs.skip != 'true'
@@ -105,18 +106,21 @@ jobs:
         if: steps.should_skip.outputs.skip != 'true'
         id: check_changes
         run: |
-          # Check if file exists in git
-          if git ls-files --error-unmatch docs/app-preview.png > /dev/null 2>&1; then
-            # File exists, check if it changed
-            if git diff --quiet docs/app-preview.png; then
+          # Check if file exists in the repository (HEAD)
+          if git cat-file -e HEAD:docs/app-preview.png 2>/dev/null; then
+            # File exists in repo, stage it and check if it changed
+            git add docs/app-preview.png
+            if git diff --cached --quiet docs/app-preview.png; then
               echo "changed=false" >> $GITHUB_OUTPUT
               echo "Screenshot unchanged, skipping commit"
+              git reset docs/app-preview.png
             else
               echo "changed=true" >> $GITHUB_OUTPUT
               echo "Screenshot changed, will commit"
             fi
           else
-            # File doesn't exist in git, this is a new file
+            # File doesn't exist in repo, this is a new file
+            git add docs/app-preview.png
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "Screenshot is new, will commit"
           fi
@@ -126,6 +130,12 @@ jobs:
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          # File is already staged from check_changes step
+          # Ensure only the screenshot file is staged (package.json files are ignored)
+          git add docs/app-preview.png
+          # Verify something is staged before committing
+          if git diff --cached --quiet; then
+            echo "Error: No changes staged for commit"
+            exit 1
+          fi
           git commit -m "chore: update README screenshot"
           git push
