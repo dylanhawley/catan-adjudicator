@@ -1,0 +1,131 @@
+name: Update README Screenshot
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  update-screenshot:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 2  # Need at least 2 commits to check the last one
+
+      # Prevent infinite loop: skip if last commit was from this workflow
+      - name: Check if should skip
+        id: should_skip
+        run: |
+          LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
+          LAST_COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          if [[ "$LAST_COMMIT_MSG" == "chore: update README screenshot"* ]] && [[ "$LAST_COMMIT_AUTHOR" == "github-actions[bot]" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Skipping: last commit was automated screenshot update"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Setup Node.js
+        if: steps.should_skip.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        if: steps.should_skip.outputs.skip != 'true'
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Install Playwright for screenshot script
+        if: steps.should_skip.outputs.skip != 'true'
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Build frontend
+        if: steps.should_skip.outputs.skip != 'true'
+        working-directory: ./frontend
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+
+      - name: Start frontend server
+        if: steps.should_skip.outputs.skip != 'true'
+        working-directory: ./frontend
+        run: |
+          npm start &
+          echo $! > /tmp/frontend.pid
+        env:
+          NODE_ENV: production
+          PORT: 3000
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+
+      - name: Wait for frontend to be ready
+        if: steps.should_skip.outputs.skip != 'true'
+        run: |
+          timeout=60
+          elapsed=0
+          while ! curl -f http://localhost:3000 > /dev/null 2>&1; do
+            if [ $elapsed -ge $timeout ]; then
+              echo "Frontend failed to start within $timeout seconds"
+              exit 1
+            fi
+            echo "Waiting for frontend to start... ($elapsed/$timeout)"
+            sleep 2
+            elapsed=$((elapsed + 2))
+          done
+          echo "Frontend is ready!"
+          # Give it a moment to fully render
+          sleep 3
+
+      - name: Take screenshot
+        if: steps.should_skip.outputs.skip != 'true'
+        working-directory: ./
+        run: |
+          node scripts/take-screenshot.js
+
+      - name: Stop frontend server
+        if: steps.should_skip.outputs.skip != 'true'
+        run: |
+          if [ -f /tmp/frontend.pid ]; then
+            kill $(cat /tmp/frontend.pid) || true
+          fi
+
+      - name: Check for screenshot changes
+        if: steps.should_skip.outputs.skip != 'true'
+        id: check_changes
+        run: |
+          # Check if file exists in git
+          if git ls-files --error-unmatch docs/app-preview.png > /dev/null 2>&1; then
+            # File exists, check if it changed
+            if git diff --quiet docs/app-preview.png; then
+              echo "changed=false" >> $GITHUB_OUTPUT
+              echo "Screenshot unchanged, skipping commit"
+            else
+              echo "changed=true" >> $GITHUB_OUTPUT
+              echo "Screenshot changed, will commit"
+            fi
+          else
+            # File doesn't exist in git, this is a new file
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Screenshot is new, will commit"
+          fi
+
+      - name: Commit and push screenshot
+        if: steps.should_skip.outputs.skip != 'true' && steps.check_changes.outputs.changed == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          # File is already staged from check_changes step
+          git commit -m "chore: update README screenshot"
+          git push

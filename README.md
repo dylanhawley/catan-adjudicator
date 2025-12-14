@@ -2,6 +2,8 @@
 
 A production-ready application for querying Catan board game rules with verified citations. Built with FastAPI backend and Next.js frontend, using LangChain for RAG orchestration, Chroma for vector storage, and react-pdf for PDF viewing with exact text highlights.
 
+![App Preview](docs/app-preview.png)
+
 ## Features
 
 - **Natural Language Q&A**: Ask questions about Catan rules in plain English
@@ -131,6 +133,32 @@ The frontend uses Next.js with:
 - TypeScript for type safety
 - TailwindCSS for styling
 - react-pdf for PDF rendering
+
+### Updating the README Screenshot
+
+The README screenshot is automatically updated on every push to the main branch via GitHub Actions. The screenshot is taken using Playwright in a headless browser to ensure accuracy.
+
+To update the screenshot manually:
+
+1. Install Playwright (if not already installed):
+   ```bash
+   npm install playwright
+   npx playwright install chromium
+   ```
+
+2. Start the frontend server:
+   ```bash
+   cd frontend
+   npm run build
+   npm start
+   ```
+
+3. In another terminal, run the screenshot script:
+   ```bash
+   APP_URL=http://localhost:3000 node scripts/take-screenshot.js
+   ```
+
+The screenshot will be saved to `docs/app-preview.png`.
 
 ## License
 
