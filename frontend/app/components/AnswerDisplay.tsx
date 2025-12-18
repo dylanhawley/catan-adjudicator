@@ -1,14 +1,21 @@
 'use client';
 
-import type { QueryResponse, SourceReference } from '@/lib/types';
+import type { SourceReference } from '@/lib/types';
 
 interface AnswerDisplayProps {
-  response: QueryResponse | null;
+  answer: string;
+  sources: SourceReference[];
+  isStreaming?: boolean;
   onSourceClick: (source: SourceReference) => void;
 }
 
-const AnswerDisplay = ({ response, onSourceClick }: AnswerDisplayProps) => {
-  if (!response) {
+const AnswerDisplay = ({
+  answer,
+  sources,
+  isStreaming = false,
+  onSourceClick,
+}: AnswerDisplayProps) => {
+  if (!answer && sources.length === 0) {
     return null;
   }
 
@@ -16,18 +23,32 @@ const AnswerDisplay = ({ response, onSourceClick }: AnswerDisplayProps) => {
     <div className="w-full space-y-4">
       <div className="bg-white rounded-lg shadow p-6">
         <h2 className="text-xl font-semibold mb-4">Answer</h2>
-        <p className="text-gray-800 whitespace-pre-wrap">{response.answer}</p>
+        <div className="text-gray-800 whitespace-pre-wrap">
+          {answer}
+          {isStreaming && (
+            <span
+              className="inline-block w-0.5 h-5 ml-0.5 bg-black animate-pulse"
+              aria-label="Loading more content"
+            />
+          )}
+        </div>
       </div>
 
-      {response.sources.length > 0 && (
+      {sources.length > 0 && (
         <div className="bg-white rounded-lg shadow p-6">
           <h3 className="text-lg font-semibold mb-3">Sources</h3>
           <ul className="space-y-2">
-            {response.sources.map((source, index) => (
-              <li key={index}>
+            {sources.map((source, index) => (
+              <li key={source.chunk_id || index}>
                 <button
                   onClick={() => onSourceClick(source)}
-                  className="text-blue-600 hover:text-blue-800 hover:underline text-sm"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      onSourceClick(source);
+                    }
+                  }}
+                  className="text-blue-600 hover:text-blue-800 hover:underline text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 rounded"
+                  tabIndex={0}
                   aria-label={`View source ${index + 1}`}
                 >
                   Source {index + 1} (Chunk: {source.chunk_id.slice(0, 8)}...)

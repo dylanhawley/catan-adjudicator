@@ -1,56 +1,88 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import QueryForm from './components/QueryForm';
 import AnswerDisplay from './components/AnswerDisplay';
 import SourceList from './components/SourceList';
 import PDFViewer from './components/PDFViewer';
-import { queryQuestion, getChunk } from '@/lib/api';
+import { queryQuestionStream, getChunk } from '@/lib/api';
 import type {
-  QueryResponse,
   SourceReference,
   ChunkResponse,
 } from '@/lib/types';
 
 export default function Home() {
-  const [queryResponse, setQueryResponse] = useState<QueryResponse | null>(
-    null
-  );
+  const [answer, setAnswer] = useState<string>('');
+  const [sources, setSources] = useState<SourceReference[]>([]);
   const [chunks, setChunks] = useState<ChunkResponse[]>([]);
   const [selectedPage, setSelectedPage] = useState(1);
   const [selectedPdfUrl, setSelectedPdfUrl] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  
+  // Use ref to accumulate answer during streaming to avoid stale closure issues
+  const answerRef = useRef<string>('');
+
+  const handleSourcesReceived = useCallback(async (receivedSources: SourceReference[]) => {
+    setSources(receivedSources);
+
+    // Fetch full chunk details for all sources
+    if (receivedSources.length > 0) {
+      try {
+        const chunkPromises = receivedSources.map((source) =>
+          getChunk(source.chunk_id)
+        );
+        const fetchedChunks = await Promise.all(chunkPromises);
+        setChunks(fetchedChunks);
+
+        // Set PDF URL from the first chunk's PDF ID
+        if (fetchedChunks.length > 0) {
+          const pdfId = fetchedChunks[0].pdf_id;
+          const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+          setSelectedPdfUrl(`${apiUrl}/api/pdf/${pdfId}`);
+          setSelectedPage(fetchedChunks[0].page_start + 1);
+        }
+      } catch (err) {
+        console.error('Error fetching chunks:', err);
+      }
+    }
+  }, []);
 
   const handleQuery = async (question: string) => {
     setIsLoading(true);
+    setIsStreaming(true);
     setError(null);
-    setQueryResponse(null);
+    setAnswer('');
+    setSources([]);
     setChunks([]);
+    answerRef.current = '';
 
     try {
-      const response = await queryQuestion(question);
-      setQueryResponse(response);
-
-      // Fetch full chunk details for all sources
-      const chunkPromises = response.sources.map((source) =>
-        getChunk(source.chunk_id)
+      await queryQuestionStream(
+        question,
+        {
+          onSources: handleSourcesReceived,
+          onToken: (token: string) => {
+            answerRef.current += token;
+            setAnswer(answerRef.current);
+          },
+          onDone: () => {
+            setIsStreaming(false);
+            setIsLoading(false);
+          },
+          onError: (errorMsg: string) => {
+            setError(errorMsg);
+            setIsStreaming(false);
+            setIsLoading(false);
+          },
+        }
       );
-      const fetchedChunks = await Promise.all(chunkPromises);
-      setChunks(fetchedChunks);
-
-      // Set PDF URL from the first chunk's PDF ID
-      if (fetchedChunks.length > 0) {
-        const pdfId = fetchedChunks[0].pdf_id;
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-        setSelectedPdfUrl(`${apiUrl}/api/pdf/${pdfId}`);
-        setSelectedPage(fetchedChunks[0].page_start + 1);
-      }
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'An error occurred while querying'
       );
-    } finally {
+      setIsStreaming(false);
       setIsLoading(false);
     }
   };
@@ -66,6 +98,8 @@ export default function Home() {
       handleSourceClick(source, chunk);
     }
   };
+
+  const hasResponse = answer.length > 0 || sources.length > 0;
 
   return (
     <main className="min-h-screen bg-gray-50 p-4 md:p-8">
@@ -92,15 +126,17 @@ export default function Home() {
               </div>
             )}
 
-            {queryResponse && (
+            {hasResponse && (
               <>
                 <AnswerDisplay
-                  response={queryResponse}
+                  answer={answer}
+                  sources={sources}
+                  isStreaming={isStreaming}
                   onSourceClick={handleSourceClickFromAnswer}
                 />
                 {chunks.length > 0 && (
                   <SourceList
-                    sources={queryResponse.sources}
+                    sources={sources}
                     chunks={chunks}
                     onSourceClick={handleSourceClick}
                   />

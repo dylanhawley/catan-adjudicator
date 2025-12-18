@@ -5,6 +5,7 @@ import type {
   QueryResponse,
   IngestionResponse,
   ChunkResponse,
+  SourceReference,
 } from './types';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -25,6 +26,115 @@ export const queryQuestion = async (
     k,
   } as QueryRequest);
   return response.data;
+};
+
+export interface StreamCallbacks {
+  onSources: (sources: SourceReference[]) => void;
+  onToken: (token: string) => void;
+  onDone: () => void;
+  onError: (error: string) => void;
+}
+
+export const queryQuestionStream = async (
+  question: string,
+  callbacks: StreamCallbacks,
+  k: number = 5
+): Promise<void> => {
+  const response = await fetch(`${API_BASE_URL}/api/query/stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ question, k } as QueryRequest),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+
+  if (!response.body) {
+    throw new Error('Response body is null');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      
+      // Process complete SSE events from the buffer
+      const lines = buffer.split('\n');
+      buffer = '';
+
+      let currentEvent = '';
+      let currentData = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          currentData = line.slice(6);
+        } else if (line === '' && currentEvent && currentData !== '') {
+          // Empty line signals end of event
+          handleSSEEvent(currentEvent, currentData, callbacks);
+          currentEvent = '';
+          currentData = '';
+        } else if (line !== '') {
+          // Incomplete event, keep in buffer
+          buffer = line;
+        }
+      }
+
+      // Keep any incomplete event in the buffer
+      if (currentEvent || currentData) {
+        if (currentEvent) buffer = `event: ${currentEvent}\n`;
+        if (currentData) buffer += `data: ${currentData}\n`;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+};
+
+const handleSSEEvent = (
+  event: string,
+  data: string,
+  callbacks: StreamCallbacks
+): void => {
+  switch (event) {
+    case 'sources':
+      try {
+        const sources = JSON.parse(data) as SourceReference[];
+        callbacks.onSources(sources);
+      } catch (e) {
+        console.error('Failed to parse sources:', e);
+      }
+      break;
+    case 'token':
+      // Unescape newlines that were escaped for SSE transport
+      const unescapedToken = data.replace(/\\n/g, '\n');
+      callbacks.onToken(unescapedToken);
+      break;
+    case 'done':
+      callbacks.onDone();
+      break;
+    case 'error':
+      try {
+        const errorData = JSON.parse(data);
+        callbacks.onError(errorData.error || 'Unknown error');
+      } catch {
+        callbacks.onError(data);
+      }
+      break;
+  }
 };
 
 export const getChunk = async (chunkId: string): Promise<ChunkResponse> => {

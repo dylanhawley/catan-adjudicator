@@ -1,6 +1,6 @@
 """Question-answering service using LangChain RAG."""
 import json
-from typing import List, Optional
+from typing import List, Optional, Generator, Tuple
 try:
     from langchain.prompts import PromptTemplate
 except ImportError:
@@ -11,6 +11,7 @@ except ImportError:
     from langchain_core.output_parsers import BaseOutputParser
 from langchain_openai import ChatOpenAI
 from langchain_google_vertexai import ChatVertexAI
+from langchain_core.documents import Document
 from app.config import settings
 from app.models.response import QueryResponse, SourceReference
 from app.services.vector_store import VectorStoreService
@@ -108,6 +109,28 @@ JSON Response:"""
             input_variables=["context", "question"]
         )
 
+    def _create_streaming_prompt_template(self) -> PromptTemplate:
+        """Create the prompt template for streaming RAG (plain text output)."""
+        template = """You are a helpful assistant that answers questions about Catan board game rules based ONLY on the provided context from official rulebooks.
+
+Context from rulebooks:
+{context}
+
+Question: {question}
+
+Instructions:
+1. Answer the question using ONLY the information provided in the context above.
+2. If the answer is not in the provided context, say "I cannot answer this question based on the available rulebook content."
+3. Be thorough but concise in your answer.
+4. Reference specific rules and provide exact quotes from the rulebooks when helpful.
+
+Answer:"""
+        
+        return PromptTemplate(
+            template=template,
+            input_variables=["context", "question"]
+        )
+
     def answer_question(self, question: str, k: int = 5) -> QueryResponse:
         """
         Answer a question using RAG.
@@ -185,4 +208,128 @@ JSON Response:"""
                 answer=f"I encountered an error while processing your question: {str(e)}. Please try again.",
                 sources=[]
             )
+
+    def _retrieve_relevant_docs(self, question: str, k: int = 5) -> List[Document]:
+        """
+        Retrieve relevant documents for a question.
+        
+        Args:
+            question: User's question
+            k: Number of chunks to retrieve
+            
+        Returns:
+            List of relevant documents
+        """
+        retriever = self.vector_store_service.get_retriever(k=k)
+        # Support both old and new LangChain API
+        if hasattr(retriever, 'invoke'):
+            return retriever.invoke(question)
+        elif hasattr(retriever, 'get_relevant_documents'):
+            return retriever.get_relevant_documents(question)
+        else:
+            # Fallback to direct vector store search
+            return self.vector_store_service.search(question, k=k)
+
+    def _format_context(self, docs: List[Document]) -> str:
+        """
+        Format documents into context string.
+        
+        Args:
+            docs: List of documents
+            
+        Returns:
+            Formatted context string
+        """
+        context_parts = []
+        for doc in docs:
+            chunk_id = doc.metadata.get("chunk_id", "")
+            page_info = f"Page {doc.metadata.get('page_start', '?')}"
+            section = doc.metadata.get("section_title", "")
+            if section:
+                context_parts.append(f"[Chunk {chunk_id}, {page_info}, Section: {section}]\n{doc.page_content}")
+            else:
+                context_parts.append(f"[Chunk {chunk_id}, {page_info}]\n{doc.page_content}")
+        
+        return "\n\n---\n\n".join(context_parts)
+
+    def _docs_to_sources(self, docs: List[Document]) -> List[SourceReference]:
+        """
+        Convert documents to source references.
+        
+        Args:
+            docs: List of documents
+            
+        Returns:
+            List of source references
+        """
+        return [
+            SourceReference(
+                chunk_id=doc.metadata.get("chunk_id", ""),
+                quote_char_start=0,
+                quote_char_end=0
+            )
+            for doc in docs
+        ]
+
+    def stream_answer_question(
+        self, question: str, k: int = 5
+    ) -> Generator[Tuple[str, any], None, None]:
+        """
+        Stream an answer to a question using RAG.
+        
+        Yields tuples of (event_type, data):
+        - ("sources", List[SourceReference]): Source references
+        - ("token", str): Token/chunk of the answer
+        - ("done", None): Streaming complete
+        - ("error", str): Error message
+        
+        Args:
+            question: User's question
+            k: Number of chunks to retrieve
+            
+        Yields:
+            Tuples of (event_type, data)
+        """
+        # Retrieve relevant chunks
+        relevant_docs = self._retrieve_relevant_docs(question, k)
+        
+        if not relevant_docs:
+            yield ("sources", [])
+            yield ("token", "I cannot answer this question as no relevant information was found in the rulebooks.")
+            yield ("done", None)
+            return
+        
+        # Send sources first
+        sources = self._docs_to_sources(relevant_docs)
+        yield ("sources", sources)
+        
+        # Format context and create prompt
+        context = self._format_context(relevant_docs)
+        prompt_template = self._create_streaming_prompt_template()
+        prompt = prompt_template.format(context=context, question=question)
+        
+        # Stream the LLM response
+        try:
+            if hasattr(self.llm, 'stream'):
+                for chunk in self.llm.stream(prompt):
+                    # Extract content from chunk
+                    if hasattr(chunk, 'content'):
+                        content = chunk.content
+                    else:
+                        content = str(chunk)
+                    
+                    if content:
+                        yield ("token", content)
+            else:
+                # Fallback for LLMs that don't support streaming
+                if hasattr(self.llm, 'invoke'):
+                    response = self.llm.invoke(prompt).content
+                else:
+                    response = self.llm.predict(prompt)
+                yield ("token", response)
+            
+            yield ("done", None)
+            
+        except Exception as e:
+            yield ("error", f"Error generating response: {str(e)}")
 
