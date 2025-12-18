@@ -31,9 +31,6 @@ const QueryForm = ({ onSubmit, isLoading = false }: QueryFormProps) => {
   return (
     <form onSubmit={handleSubmit} className="w-full">
       <div className="flex flex-col gap-2">
-        <label htmlFor="question" className="text-sm font-medium">
-          Ask a question about Catan rules:
-        </label>
         <textarea
           id="question"
           value={question}
