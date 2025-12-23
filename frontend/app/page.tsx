@@ -20,6 +20,7 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [currentQuestion, setCurrentQuestion] = useState<string>('');
   
   // Use ref to accumulate answer during streaming to avoid stale closure issues
   const answerRef = useRef<string>('');
@@ -56,6 +57,7 @@ export default function Home() {
     setAnswer('');
     setSources([]);
     setChunks([]);
+    setCurrentQuestion(question);
     answerRef.current = '';
 
     try {
@@ -129,6 +131,7 @@ export default function Home() {
             {hasResponse && (
               <>
                 <AnswerDisplay
+                  question={currentQuestion}
                   answer={answer}
                   sources={sources}
                   isStreaming={isStreaming}

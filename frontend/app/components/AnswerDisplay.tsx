@@ -3,6 +3,7 @@
 import type { SourceReference } from '@/lib/types';
 
 interface AnswerDisplayProps {
+  question: string;
   answer: string;
   sources: SourceReference[];
   isStreaming?: boolean;
@@ -10,6 +11,7 @@ interface AnswerDisplayProps {
 }
 
 const AnswerDisplay = ({
+  question,
   answer,
   sources,
   isStreaming = false,
@@ -22,6 +24,12 @@ const AnswerDisplay = ({
   return (
     <div className="w-full space-y-4">
       <div className="bg-white rounded-lg shadow p-6">
+        {question && (
+          <div className="mb-4 pb-4 border-b border-gray-200">
+            <h3 className="text-sm font-medium text-gray-500 mb-1">Question</h3>
+            <p className="text-gray-900 text-lg">{question}</p>
+          </div>
+        )}
         <h2 className="text-xl font-semibold mb-4">Answer</h2>
         <div className="text-gray-800 whitespace-pre-wrap">
           {answer}

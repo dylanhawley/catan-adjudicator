@@ -39,7 +39,7 @@ const QueryForm = ({ onSubmit, isLoading = false }: QueryFormProps) => {
           placeholder="e.g., How many resource cards can I hold?"
           disabled={isLoading}
           rows={3}
-          className="w-full px-4 py-2 bg-white border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
+          className="w-full px-4 py-2 bg-white border border-gray-300 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:cursor-not-allowed"
           aria-label="Question input"
         />
         <div className="flex justify-between items-center">
