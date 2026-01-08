@@ -110,25 +110,28 @@ JSON Response:"""
         )
 
     def _create_streaming_prompt_template(self) -> PromptTemplate:
-        """Create the prompt template for streaming RAG (plain text output)."""
+        """Create the prompt template for streaming RAG with citation markers."""
         template = """You are a helpful assistant that answers questions about Catan board game rules based ONLY on the provided context from official rulebooks.
 
 Context from rulebooks:
 {context}
 
-Question: {question}
+{conversation_history}Question: {question}
 
 Instructions:
 1. Answer the question using ONLY the information provided in the context above.
 2. If the answer is not in the provided context, say "I cannot answer this question based on the available rulebook content."
 3. Be thorough but concise in your answer.
-4. Reference specific rules and provide exact quotes from the rulebooks when helpful.
+4. When citing rules, wrap the citation in markers like this: [[CITE:chunk_id]]exact quote from rulebook[[/CITE]]
+   - Use the exact chunk_id from the context (e.g., [[CITE:abc-123-def]])
+   - Include the exact text you're quoting from that chunk
+5. You MUST cite sources when making factual claims about rules.
 
 Answer:"""
-        
+
         return PromptTemplate(
             template=template,
-            input_variables=["context", "question"]
+            input_variables=["context", "question", "conversation_history"]
         )
 
     def answer_question(self, question: str, k: int = 5) -> QueryResponse:
@@ -271,43 +274,116 @@ Answer:"""
             for doc in docs
         ]
 
+    def _format_conversation_history(self, history: list) -> str:
+        """Format conversation history for the prompt."""
+        if not history:
+            return ""
+
+        formatted = "Previous conversation:\n"
+        for msg in history:
+            role = "User" if msg.get("role") == "user" else "Assistant"
+            formatted += f"{role}: {msg.get('content', '')}\n"
+        formatted += "\n"
+        return formatted
+
+    def _parse_citations(self, text: str, docs: List[Document]) -> Tuple[str, List[SourceReference]]:
+        """
+        Parse citation markers from text and extract source references.
+
+        Args:
+            text: The full response text with [[CITE:chunk_id]]quote[[/CITE]] markers
+            docs: Retrieved documents to find quote positions
+
+        Returns:
+            Tuple of (clean_text, sources)
+        """
+        import re
+
+        sources = []
+        clean_text = text
+
+        # Find all citation markers
+        pattern = r'\[\[CITE:([^\]]+)\]\]([^\[]*)\[\[/CITE\]\]'
+        matches = re.finditer(pattern, text)
+
+        for match in matches:
+            chunk_id = match.group(1).strip()
+            quote = match.group(2).strip()
+
+            # Find the chunk and locate the quote within it
+            for doc in docs:
+                doc_chunk_id = doc.metadata.get("chunk_id", "")
+                if doc_chunk_id == chunk_id or chunk_id in doc_chunk_id:
+                    # Find quote position in chunk text
+                    chunk_text = doc.page_content
+                    quote_lower = quote.lower()
+                    chunk_lower = chunk_text.lower()
+
+                    start_pos = chunk_lower.find(quote_lower[:50] if len(quote_lower) > 50 else quote_lower)
+                    if start_pos >= 0:
+                        end_pos = start_pos + len(quote)
+                        sources.append(SourceReference(
+                            chunk_id=doc_chunk_id,
+                            quote_char_start=start_pos,
+                            quote_char_end=min(end_pos, len(chunk_text))
+                        ))
+                    else:
+                        # Couldn't find exact quote, use beginning of chunk
+                        sources.append(SourceReference(
+                            chunk_id=doc_chunk_id,
+                            quote_char_start=0,
+                            quote_char_end=min(100, len(chunk_text))
+                        ))
+                    break
+
+        # Remove citation markers from text, keeping just the quoted content
+        clean_text = re.sub(r'\[\[CITE:[^\]]+\]\]', '', clean_text)
+        clean_text = re.sub(r'\[\[/CITE\]\]', '', clean_text)
+
+        return clean_text, sources
+
     def stream_answer_question(
-        self, question: str, k: int = 5
+        self, question: str, k: int = 5, conversation_history: list = None
     ) -> Generator[Tuple[str, any], None, None]:
         """
         Stream an answer to a question using RAG.
-        
+
         Yields tuples of (event_type, data):
-        - ("sources", List[SourceReference]): Source references
+        - ("sources", List[SourceReference]): Source references (sent after answer completes)
         - ("token", str): Token/chunk of the answer
         - ("done", None): Streaming complete
         - ("error", str): Error message
-        
+
         Args:
             question: User's question
             k: Number of chunks to retrieve
-            
+            conversation_history: Previous conversation messages
+
         Yields:
             Tuples of (event_type, data)
         """
         # Retrieve relevant chunks
         relevant_docs = self._retrieve_relevant_docs(question, k)
-        
+
         if not relevant_docs:
             yield ("sources", [])
             yield ("token", "I cannot answer this question as no relevant information was found in the rulebooks.")
             yield ("done", None)
             return
-        
-        # Send sources first
-        sources = self._docs_to_sources(relevant_docs)
-        yield ("sources", sources)
-        
-        # Format context and create prompt
+
+        # Format context and conversation history
         context = self._format_context(relevant_docs)
+        conv_history = self._format_conversation_history(conversation_history or [])
         prompt_template = self._create_streaming_prompt_template()
-        prompt = prompt_template.format(context=context, question=question)
-        
+        prompt = prompt_template.format(
+            context=context,
+            question=question,
+            conversation_history=conv_history
+        )
+
+        # Collect full response to parse citations
+        full_response = ""
+
         # Stream the LLM response
         try:
             if hasattr(self.llm, 'stream'):
@@ -317,8 +393,11 @@ Answer:"""
                         content = chunk.content
                     else:
                         content = str(chunk)
-                    
+
                     if content:
+                        full_response += content
+                        # Stream tokens without citation markers for better UX
+                        # We'll send clean text - remove partial markers
                         yield ("token", content)
             else:
                 # Fallback for LLMs that don't support streaming
@@ -326,10 +405,16 @@ Answer:"""
                     response = self.llm.invoke(prompt).content
                 else:
                     response = self.llm.predict(prompt)
+                full_response = response
                 yield ("token", response)
-            
+
+            # Parse citations from the full response
+            clean_text, sources = self._parse_citations(full_response, relevant_docs)
+
+            # Send sources after answer completes
+            yield ("sources", sources if sources else self._docs_to_sources(relevant_docs))
             yield ("done", None)
-            
+
         except Exception as e:
             yield ("error", f"Error generating response: {str(e)}")
 

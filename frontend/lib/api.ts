@@ -28,6 +28,11 @@ export const queryQuestion = async (
   return response.data;
 };
 
+export interface ConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 export interface StreamCallbacks {
   onSources: (sources: SourceReference[]) => void;
   onToken: (token: string) => void;
@@ -38,14 +43,19 @@ export interface StreamCallbacks {
 export const queryQuestionStream = async (
   question: string,
   callbacks: StreamCallbacks,
-  k: number = 5
+  k: number = 5,
+  conversationHistory: ConversationMessage[] = []
 ): Promise<void> => {
   const response = await fetch(`${API_BASE_URL}/api/query/stream`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ question, k } as QueryRequest),
+    body: JSON.stringify({
+      question,
+      k,
+      conversation_history: conversationHistory,
+    }),
   });
 
   if (!response.ok) {

@@ -58,3 +58,25 @@ export interface ChunkResponse {
   atoms: Atom[];
 }
 
+export interface CitationRange {
+  sourceIndex: number;
+  source: SourceReference;
+  answerStart: number;
+  answerEnd: number;
+  quoteText: string;
+}
+
+export interface PDFHighlight {
+  pageNum: number;
+  bboxes: BBox[];
+}
+
+export interface Message {
+  id: string;
+  question: string;
+  answer: string;
+  sources: SourceReference[];
+  chunks: ChunkResponse[];
+  isStreaming: boolean;
+}
+

@@ -11,10 +11,17 @@ from app.services.qa_service import QAService
 router = APIRouter(prefix="/api/query", tags=["query"])
 
 
+class ConversationMessage(BaseModel):
+    """A message in the conversation history."""
+    role: str  # "user" or "assistant"
+    content: str
+
+
 class QueryRequest(BaseModel):
     """Request model for query endpoint."""
     question: str
     k: int = 5  # Number of chunks to retrieve
+    conversation_history: list[ConversationMessage] = []  # Previous messages for context
 
 
 @router.post("", response_model=QueryResponse)
@@ -42,20 +49,21 @@ async def query(
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 
-def generate_sse_events(qa_service: QAService, question: str, k: int):
+def generate_sse_events(qa_service: QAService, question: str, k: int, conversation_history: list = None):
     """
     Generator function for SSE events.
-    
+
     Args:
         qa_service: QA service instance
         question: User's question
         k: Number of chunks to retrieve
-        
+        conversation_history: Previous conversation messages
+
     Yields:
         SSE formatted event strings
     """
     try:
-        for event_type, data in qa_service.stream_answer_question(question, k):
+        for event_type, data in qa_service.stream_answer_question(question, k, conversation_history or []):
             if event_type == "sources":
                 # Convert SourceReference objects to dicts for JSON serialization
                 sources_data = [
@@ -94,8 +102,11 @@ async def query_stream(
     Returns:
         StreamingResponse with SSE events
     """
+    # Convert conversation history to list of dicts
+    history = [{"role": msg.role, "content": msg.content} for msg in request.conversation_history]
+
     return StreamingResponse(
-        generate_sse_events(qa_service, request.question, request.k),
+        generate_sse_events(qa_service, request.question, request.k, history),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
