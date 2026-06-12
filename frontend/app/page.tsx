@@ -119,7 +119,6 @@ export default function Home() {
             setIsLoading(false);
           },
         },
-        5,
         conversationHistory
       );
     } catch (err) {

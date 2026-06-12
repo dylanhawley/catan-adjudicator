@@ -1,6 +1,6 @@
 # Catan Rules Q&A App
 
-A production-ready application for querying Catan board game rules with verified citations. Built with FastAPI backend and Next.js frontend, using LangChain for RAG orchestration, Chroma for vector storage, and react-pdf for PDF viewing with exact text highlights.
+An application for querying Catan board game rules with verified citations. Built with a FastAPI backend and Next.js frontend, using the OpenAI API for retrieval-augmented answers, Chroma for vector storage, and react-pdf for PDF viewing with exact text highlights.
 
 ![App Preview](docs/app-preview.png)
 
@@ -13,10 +13,10 @@ A production-ready application for querying Catan board game rules with verified
 
 ## Architecture
 
-- **Backend**: FastAPI (Python) with LangChain for RAG
+- **Backend**: FastAPI (Python) calling the OpenAI API directly for RAG
 - **Frontend**: Next.js (TypeScript/React) with react-pdf
-- **Vector Store**: Chroma (via LangChain)
-- **LLM**: Support for both OpenAI and Google Vertex AI (configurable)
+- **Vector Store**: Chroma (local, persistent)
+- **LLM**: OpenAI (`gpt-4o` for answers, `gpt-4o-mini` to rewrite follow-up questions into standalone search queries)
 - **PDF Processing**: Custom pipeline using PyMuPDF for coordinate tracking
 
 ## Project Structure
@@ -55,11 +55,13 @@ cp .env.example .env
 ```
 
 5. Configure your `.env` file with:
-   - `LLM_PROVIDER`: "openai" or "vertex"
-   - `OPENAI_API_KEY`: Your OpenAI API key (if using OpenAI)
-   - `GOOGLE_APPLICATION_CREDENTIALS`: Path to credentials (if using Vertex)
-   - `VERTEX_PROJECT_ID`: Your GCP project ID (if using Vertex)
+   - `OPENAI_API_KEY`: Your OpenAI API key (required)
+   - `OPENAI_MODEL`: Model used to answer questions (default: gpt-4o)
+   - `CONDENSE_MODEL`: Model used to rewrite follow-up questions (default: gpt-4o-mini)
+   - `EMBEDDING_MODEL`: Embedding model (default: text-embedding-3-small)
+   - `RETRIEVAL_K`: Number of rulebook chunks retrieved per question (default: 8)
    - `CHROMA_PERSIST_DIR`: Directory for Chroma database (default: ./chroma_db)
+   - `CORS_ORIGINS`: Comma-separated allowed frontend origins (default: localhost:3000/3001)
 
 6. Run the backend:
 ```bash
@@ -91,6 +93,10 @@ npm run dev
 The application will be available at `http://localhost:3000`.
 
 ## Usage
+
+> **Upgrading from the LangChain version?** The vector store format changed. Delete your old
+> `chroma_db` directory and re-ingest your PDFs (`python ingest_existing_pdfs.py` from the
+> `backend` directory with rulebook PDFs in `data/`).
 
 ### Ingesting PDFs
 
@@ -126,6 +132,12 @@ curl -X POST "http://localhost:8000/api/ingest" \
 The backend uses FastAPI with automatic API documentation available at:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+Run the backend tests (no API key needed):
+```bash
+cd backend
+python tests/test_qa_service.py
+```
 
 ### Frontend Development
 

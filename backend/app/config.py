@@ -1,6 +1,5 @@
 """Configuration management for the application."""
 from pathlib import Path
-from typing import Literal
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import (
@@ -19,7 +18,7 @@ class Settings(BaseSettings):
         env_file=str(ENV_FILE),
         case_sensitive=False,
     )
-    
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -36,51 +35,42 @@ class Settings(BaseSettings):
             env_settings,       # 3. Environment variables (now lower priority)
             file_secret_settings,  # 4. Secrets directory (lowest priority)
         )
-    
-    # LLM Provider Configuration
-    llm_provider: Literal["openai", "vertex"] = "openai"
-    
+
     # OpenAI Configuration
     openai_api_key: str = ""
-    
-    # Google Vertex AI Configuration
-    google_application_credentials: str = ""
-    vertex_project_id: str = ""
-    vertex_location: str = "us-central1"
-    
+
+    # Model used to answer questions
+    openai_model: str = "gpt-4o"
+    # Cheaper model used to rewrite follow-up questions into standalone search queries
+    condense_model: str = "gpt-4o-mini"
+    embedding_model: str = "text-embedding-3-small"
+
+    # Retrieval configuration
+    retrieval_k: int = 8
+
     # Chroma Configuration
     chroma_persist_dir: str = "./chroma_db"
-    
-    # Embedding Model Configuration
-    embedding_model: str = "text-embedding-3-small"  # OpenAI default
-    vertex_embedding_model: str = "textembedding-gecko@003"  # Vertex default
-    
-    # LLM Model Configuration
-    openai_model: str = "gpt-4"
-    vertex_model: str = "gemini-1.5-pro"
-    
+
+    # Comma-separated list of allowed CORS origins for the frontend
+    cors_origins: str = "http://localhost:3000,http://localhost:3001"
+
     @field_validator("chroma_persist_dir")
     @classmethod
     def ensure_chroma_dir_exists(cls, v: str) -> str:
         """Ensure Chroma directory exists."""
         Path(v).mkdir(parents=True, exist_ok=True)
         return v
-    
+
     @model_validator(mode="after")
-    def validate_provider_settings(self) -> "Settings":
-        """Validate provider-specific settings."""
-        if self.llm_provider == "openai" and not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is required when using OpenAI provider")
-        
-        if self.llm_provider == "vertex":
-            if not self.google_application_credentials:
-                raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is required when using Vertex provider")
-            if not self.vertex_project_id:
-                raise ValueError("VERTEX_PROJECT_ID is required when using Vertex provider")
-        
+    def validate_api_key(self) -> "Settings":
+        if not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required")
         return self
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
 
 # Global settings instance
 settings = Settings()
-

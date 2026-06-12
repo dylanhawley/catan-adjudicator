@@ -19,11 +19,11 @@ const apiClient = axios.create({
 
 export const queryQuestion = async (
   question: string,
-  k: number = 5
+  k?: number
 ): Promise<QueryResponse> => {
   const response = await apiClient.post<QueryResponse>('/api/query', {
     question,
-    k,
+    ...(k !== undefined && { k }),
   } as QueryRequest);
   return response.data;
 };
@@ -43,7 +43,6 @@ export interface StreamCallbacks {
 export const queryQuestionStream = async (
   question: string,
   callbacks: StreamCallbacks,
-  k: number = 5,
   conversationHistory: ConversationMessage[] = []
 ): Promise<void> => {
   const response = await fetch(`${API_BASE_URL}/api/query/stream`, {
@@ -53,7 +52,6 @@ export const queryQuestionStream = async (
     },
     body: JSON.stringify({
       question,
-      k,
       conversation_history: conversationHistory,
     }),
   });

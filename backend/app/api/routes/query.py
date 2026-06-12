@@ -20,7 +20,7 @@ class ConversationMessage(BaseModel):
 class QueryRequest(BaseModel):
     """Request model for query endpoint."""
     question: str
-    k: int = 5  # Number of chunks to retrieve
+    k: int | None = None  # Number of chunks to retrieve (defaults to settings.retrieval_k)
     conversation_history: list[ConversationMessage] = []  # Previous messages for context
 
 
@@ -49,7 +49,7 @@ async def query(
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 
-def generate_sse_events(qa_service: QAService, question: str, k: int, conversation_history: list = None):
+def generate_sse_events(qa_service: QAService, question: str, k: int | None, conversation_history: list = None):
     """
     Generator function for SSE events.
 

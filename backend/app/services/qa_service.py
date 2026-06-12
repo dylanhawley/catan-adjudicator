@@ -1,46 +1,107 @@
-"""Question-answering service using LangChain RAG."""
-import json
-from typing import List, Optional, Generator, Tuple
-try:
-    from langchain.prompts import PromptTemplate
-except ImportError:
-    from langchain_core.prompts import PromptTemplate
-try:
-    from langchain.schema import BaseOutputParser
-except ImportError:
-    from langchain_core.output_parsers import BaseOutputParser
-from langchain_openai import ChatOpenAI
-from langchain_google_vertexai import ChatVertexAI
-from langchain_core.documents import Document
+"""Question-answering service using retrieval-augmented generation."""
+import re
+from typing import Generator, List, Optional, Tuple
+
+from openai import OpenAI
+
 from app.config import settings
 from app.models.response import QueryResponse, SourceReference
-from app.services.vector_store import VectorStoreService
+from app.services.vector_store import RetrievedChunk, VectorStoreService
+
+OPEN_PREFIX = "[[CITE:"
+CLOSE_MARKER = "[[/CITE]]"
+CITATION_RE = re.compile(r"\[\[CITE:([^\]]+)\]\](.*?)\[\[/CITE\]\]", re.DOTALL)
+MARKER_RE = re.compile(r"\[\[CITE:[^\]]*\]\]|\[\[/CITE\]\]")
+
+SYSTEM_PROMPT = """You are the Catan Adjudicator: an expert referee for the board game CATAN. \
+You answer rules questions using ONLY the provided rulebook excerpts.
+
+Rules:
+1. Lead with the ruling. Answer the question directly in the first sentence, then explain.
+2. Base every factual claim on the excerpts. When you state a rule, cite it by wrapping a \
+verbatim quote in markers: [[CITE:chunk_id]]exact text copied from that excerpt[[/CITE]]
+   - chunk_id must be one of the chunk IDs shown in the excerpts.
+   - The quoted text must appear word-for-word in that excerpt.
+3. If the excerpts only partially cover the question, answer what you can and say clearly \
+which part the rulebook excerpts do not cover.
+4. If the excerpts contain nothing relevant, say you cannot answer from the available \
+rulebook content. Never invent rules.
+5. Keep answers concise and practical for players in the middle of a game."""
+
+CONDENSE_PROMPT = """Rewrite the user's latest question as a single standalone question \
+suitable for searching a Catan rulebook. Resolve pronouns and references using the \
+conversation. Return only the rewritten question, nothing else."""
 
 
-class JSONOutputParser(BaseOutputParser):
-    """Parser for JSON output from LLM."""
-    
-    def parse(self, text: str) -> dict:
-        """Parse JSON from LLM output."""
-        # Try to extract JSON from markdown code blocks
-        text = text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Fallback: try to extract JSON object
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                return json.loads(text[start:end])
-            raise ValueError(f"Could not parse JSON from: {text}")
+class CitationMarkerFilter:
+    """Strips [[CITE:...]] and [[/CITE]] markers from a token stream.
+
+    Markers can be split across tokens, so text that might be the start of a
+    marker is held back until it either completes (and is dropped) or turns
+    out to be ordinary text (and is emitted).
+    """
+
+    def __init__(self):
+        self._buffer = ""
+
+    def feed(self, delta: str) -> str:
+        """Add a token to the filter and return the text safe to emit."""
+        buf = self._buffer + delta
+        out: List[str] = []
+        pos = 0
+        while True:
+            idx = buf.find("[", pos)
+            if idx == -1:
+                out.append(buf[pos:])
+                self._buffer = ""
+                break
+            out.append(buf[pos:idx])
+            consumed = self._match_marker(buf[idx:])
+            if consumed == -1:
+                # Could still grow into a marker; hold it back
+                self._buffer = buf[idx:]
+                break
+            if consumed == 0:
+                # Just a literal '[' character
+                out.append("[")
+                pos = idx + 1
+            else:
+                pos = idx + consumed
+        return "".join(out)
+
+    def flush(self) -> str:
+        """Return any held-back text that never completed a marker."""
+        leftover = self._buffer
+        self._buffer = ""
+        # A lone '[' was held only because it might have started a marker
+        return leftover if leftover == "[" else ""
+
+    @staticmethod
+    def _match_marker(s: str) -> int:
+        """For text starting with '[': return the length of a complete marker,
+        -1 if it could still grow into one, or 0 if it can never be one."""
+        if s.startswith(CLOSE_MARKER):
+            return len(CLOSE_MARKER)
+        if CLOSE_MARKER.startswith(s):
+            return -1
+        if OPEN_PREFIX.startswith(s):
+            return -1
+        if s.startswith(OPEN_PREFIX):
+            body = s[len(OPEN_PREFIX):]
+            bracket = body.find("]")
+            if bracket == -1:
+                return -1  # still reading the chunk id
+            after = body[bracket + 1:]
+            if after.startswith("]"):
+                return len(OPEN_PREFIX) + bracket + 2
+            if after == "":
+                return -1  # saw ']', waiting for the second ']'
+        return 0
+
+
+def strip_citation_markers(text: str) -> str:
+    """Remove citation markers, keeping the quoted text."""
+    return MARKER_RE.sub("", text)
 
 
 class QAService:
@@ -49,308 +110,176 @@ class QAService:
     def __init__(self, vector_store_service: VectorStoreService):
         """
         Initialize the QA service.
-        
+
         Args:
             vector_store_service: Vector store service instance
         """
         self.vector_store_service = vector_store_service
-        self.llm = self._create_llm()
-        self.output_parser = JSONOutputParser()
+        self.client = OpenAI(api_key=settings.openai_api_key)
 
-    def _create_llm(self):
-        """Create the appropriate LLM based on configuration."""
-        if settings.llm_provider == "openai":
-            return ChatOpenAI(
-                model_name=settings.openai_model,
-                openai_api_key=settings.openai_api_key,
-                temperature=0
-            )
-        elif settings.llm_provider == "vertex":
-            return ChatVertexAI(
-                model_name=settings.vertex_model,
-                project=settings.vertex_project_id,
-                location=settings.vertex_location,
-                temperature=0
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {settings.llm_provider}")
+    def _condense_question(self, question: str, history: List[dict]) -> str:
+        """Rewrite a follow-up question into a standalone search query.
 
-    def _create_prompt_template(self) -> PromptTemplate:
-        """Create the prompt template for RAG."""
-        template = """You are a helpful assistant that answers questions about Catan board game rules based ONLY on the provided context from official rulebooks.
-
-Context from rulebooks:
-{context}
-
-Question: {question}
-
-Instructions:
-1. Answer the question using ONLY the information provided in the context above.
-2. If the answer is not in the provided context, say "I cannot answer this question based on the available rulebook content."
-3. Cite specific sources by referencing the chunk IDs where you found the information.
-4. Provide exact quotes from the rulebooks when possible.
-
-Respond in the following JSON format:
-{{
-  "answer": "Your answer here",
-  "sources": [
-    {{
-      "chunk_id": "chunk_id_here",
-      "quote_char_start": 0,
-      "quote_char_end": 50
-    }}
-  ]
-}}
-
-JSON Response:"""
-        
-        return PromptTemplate(
-            template=template,
-            input_variables=["context", "question"]
-        )
-
-    def _create_streaming_prompt_template(self) -> PromptTemplate:
-        """Create the prompt template for streaming RAG with citation markers."""
-        template = """You are a helpful assistant that answers questions about Catan board game rules based ONLY on the provided context from official rulebooks.
-
-Context from rulebooks:
-{context}
-
-{conversation_history}Question: {question}
-
-Instructions:
-1. Answer the question using ONLY the information provided in the context above.
-2. If the answer is not in the provided context, say "I cannot answer this question based on the available rulebook content."
-3. Be thorough but concise in your answer.
-4. When citing rules, wrap the citation in markers like this: [[CITE:chunk_id]]exact quote from rulebook[[/CITE]]
-   - Use the exact chunk_id from the context (e.g., [[CITE:abc-123-def]])
-   - Include the exact text you're quoting from that chunk
-5. You MUST cite sources when making factual claims about rules.
-
-Answer:"""
-
-        return PromptTemplate(
-            template=template,
-            input_variables=["context", "question", "conversation_history"]
-        )
-
-    def answer_question(self, question: str, k: int = 5) -> QueryResponse:
+        Follow-ups like "what about cities?" retrieve poorly as-is because the
+        vector search has no conversation context.
         """
-        Answer a question using RAG.
-        
+        if not history:
+            return question
+        try:
+            convo_lines = []
+            for msg in history:
+                role = "User" if msg.get("role") == "user" else "Assistant"
+                content = strip_citation_markers(msg.get("content", "")).strip()
+                if content:
+                    convo_lines.append(f"{role}: {content}")
+            convo_lines.append(f"User: {question}")
+            response = self.client.chat.completions.create(
+                model=settings.condense_model,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": CONDENSE_PROMPT},
+                    {"role": "user", "content": "\n".join(convo_lines)},
+                ],
+            )
+            rewritten = (response.choices[0].message.content or "").strip()
+            return rewritten or question
+        except Exception:
+            # Retrieval with the raw question is better than failing outright
+            return question
+
+    def _format_context(self, chunks: List[RetrievedChunk]) -> str:
+        """Format retrieved chunks into the excerpt block shown to the model."""
+        parts = []
+        for chunk in chunks:
+            chunk_id = chunk.metadata.get("chunk_id", "")
+            header = f"[Chunk {chunk_id}, Page {chunk.metadata.get('page_start', '?')}"
+            section = chunk.metadata.get("section_title", "")
+            if section:
+                header += f", Section: {section}"
+            header += "]"
+            parts.append(f"{header}\n{chunk.text}")
+        return "\n\n---\n\n".join(parts)
+
+    def _build_messages(
+        self,
+        question: str,
+        context: str,
+        history: Optional[List[dict]] = None,
+    ) -> List[dict]:
+        """Build the chat messages for the answer model."""
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for msg in (history or [])[-12:]:
+            role = "assistant" if msg.get("role") == "assistant" else "user"
+            content = strip_citation_markers(msg.get("content", "")).strip()
+            if content:
+                messages.append({"role": role, "content": content})
+        messages.append({
+            "role": "user",
+            "content": f"Rulebook excerpts:\n\n{context}\n\nQuestion: {question}",
+        })
+        return messages
+
+    def _parse_citations(
+        self, text: str, chunks: List[RetrievedChunk]
+    ) -> List[SourceReference]:
+        """Extract source references from [[CITE:...]] markers in the response."""
+        sources: List[SourceReference] = []
+        seen = set()
+
+        for match in CITATION_RE.finditer(text):
+            cited_id = match.group(1).strip()
+            quote = match.group(2).strip()
+
+            for chunk in chunks:
+                chunk_id = chunk.metadata.get("chunk_id", "")
+                if chunk_id != cited_id and cited_id not in chunk_id:
+                    continue
+
+                chunk_text = chunk.text
+                needle = quote.lower()[:50] if len(quote) > 50 else quote.lower()
+                start = chunk_text.lower().find(needle) if needle else -1
+                if start >= 0:
+                    end = min(start + len(quote), len(chunk_text))
+                else:
+                    # Quote not found verbatim; highlight the start of the chunk
+                    start = 0
+                    end = min(100, len(chunk_text))
+
+                key = (chunk_id, start, end)
+                if key not in seen:
+                    seen.add(key)
+                    sources.append(SourceReference(
+                        chunk_id=chunk_id,
+                        quote_char_start=start,
+                        quote_char_end=end,
+                    ))
+                break
+
+        return sources
+
+    def _fallback_sources(self, chunks: List[RetrievedChunk]) -> List[SourceReference]:
+        """Source references covering retrieved chunks when no citations parsed."""
+        return [
+            SourceReference(
+                chunk_id=chunk.metadata.get("chunk_id", ""),
+                quote_char_start=0,
+                quote_char_end=0,
+            )
+            for chunk in chunks
+        ]
+
+    def answer_question(self, question: str, k: Optional[int] = None) -> QueryResponse:
+        """
+        Answer a question using RAG (non-streaming).
+
         Args:
             question: User's question
             k: Number of chunks to retrieve
-            
+
         Returns:
             QueryResponse with answer and sources
         """
-        # Retrieve relevant chunks
-        retriever = self.vector_store_service.get_retriever(k=k)
-        # Support both old and new LangChain API
-        if hasattr(retriever, 'invoke'):
-            relevant_docs = retriever.invoke(question)
-        elif hasattr(retriever, 'get_relevant_documents'):
-            relevant_docs = retriever.get_relevant_documents(question)
-        else:
-            # Fallback to direct vector store search
-            relevant_docs = self.vector_store_service.search(question, k=k)
-        
-        if not relevant_docs:
+        k = k or settings.retrieval_k
+        chunks = self.vector_store_service.search(question, k=k)
+
+        if not chunks:
             return QueryResponse(
                 answer="I cannot answer this question as no relevant information was found in the rulebooks.",
-                sources=[]
+                sources=[],
             )
-        
-        # Format context
-        context_parts = []
-        for doc in relevant_docs:
-            chunk_id = doc.metadata.get("chunk_id", "")
-            page_info = f"Page {doc.metadata.get('page_start', '?')}"
-            section = doc.metadata.get("section_title", "")
-            if section:
-                context_parts.append(f"[Chunk {chunk_id}, {page_info}, Section: {section}]\n{doc.page_content}")
-            else:
-                context_parts.append(f"[Chunk {chunk_id}, {page_info}]\n{doc.page_content}")
-        
-        context = "\n\n---\n\n".join(context_parts)
-        
-        # Create prompt
-        prompt_template = self._create_prompt_template()
-        prompt = prompt_template.format(context=context, question=question)
-        
-        # Call LLM
+
+        messages = self._build_messages(question, self._format_context(chunks))
+
         try:
-            # Use invoke for newer LangChain versions, fallback to predict
-            if hasattr(self.llm, 'invoke'):
-                response = self.llm.invoke(prompt).content
-            else:
-                response = self.llm.predict(prompt)
-            
-            # Parse JSON response
-            parsed = self.output_parser.parse(response)
-            
-            # Extract answer and sources
-            answer = parsed.get("answer", "I cannot answer this question.")
-            sources_data = parsed.get("sources", [])
-            
-            sources = [
-                SourceReference(
-                    chunk_id=src.get("chunk_id", ""),
-                    quote_char_start=src.get("quote_char_start", 0),
-                    quote_char_end=src.get("quote_char_end", 0)
-                )
-                for src in sources_data
-            ]
-            
-            return QueryResponse(answer=answer, sources=sources)
-            
+            response = self.client.chat.completions.create(
+                model=settings.openai_model,
+                temperature=0,
+                messages=messages,
+            )
+            raw_answer = response.choices[0].message.content or ""
+            sources = self._parse_citations(raw_answer, chunks)
+            return QueryResponse(
+                answer=strip_citation_markers(raw_answer).strip(),
+                sources=sources or self._fallback_sources(chunks),
+            )
         except Exception as e:
-            # Fallback response on error
             return QueryResponse(
                 answer=f"I encountered an error while processing your question: {str(e)}. Please try again.",
-                sources=[]
+                sources=[],
             )
-
-    def _retrieve_relevant_docs(self, question: str, k: int = 5) -> List[Document]:
-        """
-        Retrieve relevant documents for a question.
-        
-        Args:
-            question: User's question
-            k: Number of chunks to retrieve
-            
-        Returns:
-            List of relevant documents
-        """
-        retriever = self.vector_store_service.get_retriever(k=k)
-        # Support both old and new LangChain API
-        if hasattr(retriever, 'invoke'):
-            return retriever.invoke(question)
-        elif hasattr(retriever, 'get_relevant_documents'):
-            return retriever.get_relevant_documents(question)
-        else:
-            # Fallback to direct vector store search
-            return self.vector_store_service.search(question, k=k)
-
-    def _format_context(self, docs: List[Document]) -> str:
-        """
-        Format documents into context string.
-        
-        Args:
-            docs: List of documents
-            
-        Returns:
-            Formatted context string
-        """
-        context_parts = []
-        for doc in docs:
-            chunk_id = doc.metadata.get("chunk_id", "")
-            page_info = f"Page {doc.metadata.get('page_start', '?')}"
-            section = doc.metadata.get("section_title", "")
-            if section:
-                context_parts.append(f"[Chunk {chunk_id}, {page_info}, Section: {section}]\n{doc.page_content}")
-            else:
-                context_parts.append(f"[Chunk {chunk_id}, {page_info}]\n{doc.page_content}")
-        
-        return "\n\n---\n\n".join(context_parts)
-
-    def _docs_to_sources(self, docs: List[Document]) -> List[SourceReference]:
-        """
-        Convert documents to source references.
-        
-        Args:
-            docs: List of documents
-            
-        Returns:
-            List of source references
-        """
-        return [
-            SourceReference(
-                chunk_id=doc.metadata.get("chunk_id", ""),
-                quote_char_start=0,
-                quote_char_end=0
-            )
-            for doc in docs
-        ]
-
-    def _format_conversation_history(self, history: list) -> str:
-        """Format conversation history for the prompt."""
-        if not history:
-            return ""
-
-        formatted = "Previous conversation:\n"
-        for msg in history:
-            role = "User" if msg.get("role") == "user" else "Assistant"
-            formatted += f"{role}: {msg.get('content', '')}\n"
-        formatted += "\n"
-        return formatted
-
-    def _parse_citations(self, text: str, docs: List[Document]) -> Tuple[str, List[SourceReference]]:
-        """
-        Parse citation markers from text and extract source references.
-
-        Args:
-            text: The full response text with [[CITE:chunk_id]]quote[[/CITE]] markers
-            docs: Retrieved documents to find quote positions
-
-        Returns:
-            Tuple of (clean_text, sources)
-        """
-        import re
-
-        sources = []
-        clean_text = text
-
-        # Find all citation markers
-        pattern = r'\[\[CITE:([^\]]+)\]\]([^\[]*)\[\[/CITE\]\]'
-        matches = re.finditer(pattern, text)
-
-        for match in matches:
-            chunk_id = match.group(1).strip()
-            quote = match.group(2).strip()
-
-            # Find the chunk and locate the quote within it
-            for doc in docs:
-                doc_chunk_id = doc.metadata.get("chunk_id", "")
-                if doc_chunk_id == chunk_id or chunk_id in doc_chunk_id:
-                    # Find quote position in chunk text
-                    chunk_text = doc.page_content
-                    quote_lower = quote.lower()
-                    chunk_lower = chunk_text.lower()
-
-                    start_pos = chunk_lower.find(quote_lower[:50] if len(quote_lower) > 50 else quote_lower)
-                    if start_pos >= 0:
-                        end_pos = start_pos + len(quote)
-                        sources.append(SourceReference(
-                            chunk_id=doc_chunk_id,
-                            quote_char_start=start_pos,
-                            quote_char_end=min(end_pos, len(chunk_text))
-                        ))
-                    else:
-                        # Couldn't find exact quote, use beginning of chunk
-                        sources.append(SourceReference(
-                            chunk_id=doc_chunk_id,
-                            quote_char_start=0,
-                            quote_char_end=min(100, len(chunk_text))
-                        ))
-                    break
-
-        # Remove citation markers from text, keeping just the quoted content
-        clean_text = re.sub(r'\[\[CITE:[^\]]+\]\]', '', clean_text)
-        clean_text = re.sub(r'\[\[/CITE\]\]', '', clean_text)
-
-        return clean_text, sources
 
     def stream_answer_question(
-        self, question: str, k: int = 5, conversation_history: list = None
+        self,
+        question: str,
+        k: Optional[int] = None,
+        conversation_history: Optional[List[dict]] = None,
     ) -> Generator[Tuple[str, any], None, None]:
         """
         Stream an answer to a question using RAG.
 
         Yields tuples of (event_type, data):
-        - ("sources", List[SourceReference]): Source references (sent after answer completes)
-        - ("token", str): Token/chunk of the answer
+        - ("token", str): Chunk of the answer (citation markers already stripped)
+        - ("sources", List[SourceReference]): Sources (sent after answer completes)
         - ("done", None): Streaming complete
         - ("error", str): Error message
 
@@ -362,59 +291,51 @@ Answer:"""
         Yields:
             Tuples of (event_type, data)
         """
-        # Retrieve relevant chunks
-        relevant_docs = self._retrieve_relevant_docs(question, k)
+        k = k or settings.retrieval_k
+        history = conversation_history or []
 
-        if not relevant_docs:
+        try:
+            search_query = self._condense_question(question, history)
+            chunks = self.vector_store_service.search(search_query, k=k)
+        except Exception as e:
+            yield ("error", f"Error retrieving rulebook content: {str(e)}")
+            return
+
+        if not chunks:
             yield ("sources", [])
             yield ("token", "I cannot answer this question as no relevant information was found in the rulebooks.")
             yield ("done", None)
             return
 
-        # Format context and conversation history
-        context = self._format_context(relevant_docs)
-        conv_history = self._format_conversation_history(conversation_history or [])
-        prompt_template = self._create_streaming_prompt_template()
-        prompt = prompt_template.format(
-            context=context,
-            question=question,
-            conversation_history=conv_history
-        )
-
-        # Collect full response to parse citations
+        messages = self._build_messages(question, self._format_context(chunks), history)
+        marker_filter = CitationMarkerFilter()
         full_response = ""
 
-        # Stream the LLM response
         try:
-            if hasattr(self.llm, 'stream'):
-                for chunk in self.llm.stream(prompt):
-                    # Extract content from chunk
-                    if hasattr(chunk, 'content'):
-                        content = chunk.content
-                    else:
-                        content = str(chunk)
+            stream = self.client.chat.completions.create(
+                model=settings.openai_model,
+                temperature=0,
+                messages=messages,
+                stream=True,
+            )
+            for event in stream:
+                if not event.choices:
+                    continue
+                delta = event.choices[0].delta.content
+                if not delta:
+                    continue
+                full_response += delta
+                clean = marker_filter.feed(delta)
+                if clean:
+                    yield ("token", clean)
 
-                    if content:
-                        full_response += content
-                        # Stream tokens without citation markers for better UX
-                        # We'll send clean text - remove partial markers
-                        yield ("token", content)
-            else:
-                # Fallback for LLMs that don't support streaming
-                if hasattr(self.llm, 'invoke'):
-                    response = self.llm.invoke(prompt).content
-                else:
-                    response = self.llm.predict(prompt)
-                full_response = response
-                yield ("token", response)
+            leftover = marker_filter.flush()
+            if leftover:
+                yield ("token", leftover)
 
-            # Parse citations from the full response
-            clean_text, sources = self._parse_citations(full_response, relevant_docs)
-
-            # Send sources after answer completes
-            yield ("sources", sources if sources else self._docs_to_sources(relevant_docs))
+            sources = self._parse_citations(full_response, chunks)
+            yield ("sources", sources or self._fallback_sources(chunks))
             yield ("done", None)
 
         except Exception as e:
             yield ("error", f"Error generating response: {str(e)}")
-
